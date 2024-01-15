@@ -1,4 +1,6 @@
 
+This repo is the official implementation of "Dynamic region-aware convolution"
+
 ## Compile cuda version of DRConv
     - `cd Deformable MatMul3`
     - `bash compile.sh`
