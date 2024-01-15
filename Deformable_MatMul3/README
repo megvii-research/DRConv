@@ -1,0 +1,7 @@
+2.0 support batch mask & batch weight
+3.0 support the gradient for Alpha in backward
+
+input: n, c, h, w
+weight: [n,] o, c, num
+mask: [n,] h, w
+Alpha: [n,], h, w, num

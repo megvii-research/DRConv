@@ -1,0 +1,311 @@
+// Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+//#include <torch/extension.h>
+#include <torch/types.h>
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#include <vector>
+
+//#include <ATen/ATen.h>
+//#include <ATen/cuda/CUDAContext.h>
+//#include <THC/THC.h>
+//#include <THC/THCAtomics.cuh>
+//#include <THC/THCDeviceUtils.cuh>
+
+// TODO make it in a common file
+//#define CUDA_1D_KERNEL_LOOP(i, n)                            \
+//  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; \
+//       i += blockDim.x * gridDim.x)
+
+//typedef double scalar;
+
+template <typename scalar_t>
+__global__ void Deformable_MatMul_FForward(
+    size_t state_size, 
+    const scalar_t* __restrict__ mat0, 
+    const scalar_t* __restrict__ mat1,
+    const scalar_t* __restrict__ mask,
+    size_t batch, 
+    size_t input_channel, 
+    size_t height, 
+    size_t width, 
+    size_t output_channel, 
+    size_t num,
+    size_t mask_num,
+    size_t batch_W,
+    scalar_t* __restrict__ output) {
+
+    int t0 = blockIdx.y;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(index < state_size){
+	    int t3 = index % width;
+	    int t2 = (index / width) % height;
+	    int t1 = (index / width / height) % output_channel;
+
+	    int offset0 = (t0 * input_channel * height + t2) * width + t3;
+        int offset0_1 = height * width;
+	    int offset1 = mask_num == 1 ? t1 * input_channel * num + mask[t2 * width + t3] : t1 * input_channel * num + mask[(t0 * height + t2) * width + t3];
+		offset1 = batch_W == 1 ? offset1 : offset1 + t0 * output_channel * input_channel * num;
+    
+	    scalar_t sum = 0.0;
+	    for(int i = 0; i < input_channel; ++i){
+		    sum += mat0[offset0 + i * offset0_1] * mat1[offset1 + i * num];
+	    }
+	    output[t0 * state_size + index] = sum;
+    }
+}
+
+template <typename scalar_t>
+__global__ void Deformable_MatMul_0FBackward(
+    size_t state0_size, 
+    const scalar_t* __restrict__ grad_output, 
+    const scalar_t* __restrict__ mat1,
+    const scalar_t* __restrict__ mask,
+    size_t batch, 
+    size_t input_channel, 
+    size_t height, 
+    size_t width, 
+    size_t output_channel, 
+    size_t num,
+    size_t mask_num,
+    size_t batch_W,
+    scalar_t* __restrict__ grad_mat0) {
+    
+    int t0 = blockIdx.y;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+   
+    if(index < state0_size) {
+    int t3 = index % width;
+    int t2 = (index / width) % height;
+    int t1 = (index / width / height) % input_channel;
+
+	int offset_output = (t0 * output_channel * height + t2) * width + t3;
+    int offset_output_0 = height * width;
+    int offset_mat1 = (mask_num == 1) ? (t1 * num + mask[t2 * width + t3]) : (t1 * num + mask[(t0 * height + t2) * width + t3]);
+	offset_mat1 = batch_W == 1 ? offset_mat1 : offset_mat1 + t0 * output_channel * input_channel * num;
+    int offset_mat1_0 = input_channel * num;
+
+    scalar_t gradient = 0.0;
+    for(int i = 0; i < output_channel; ++i){
+        gradient += grad_output[offset_output + i * offset_output_0] * mat1[offset_mat1 + i * offset_mat1_0];
+    }
+    grad_mat0[t0 * state0_size + index] = gradient;
+
+  }
+}
+
+template <typename scalar_t>
+__global__ void Deformable_MatMul_1FBackward(
+    size_t state1_size, 
+    const scalar_t* __restrict__ grad_output, 
+    const scalar_t* __restrict__ mat0,
+    const scalar_t* __restrict__ mat1,
+    const scalar_t* __restrict__ mask,
+    const scalar_t* __restrict__ Alpha,
+    size_t batch, 
+    size_t input_channel, 
+    size_t height, 
+    size_t width, 
+    size_t output_channel, 
+    size_t num,
+    size_t mask_num,
+    size_t batch_W,
+    size_t use_alpha,
+    scalar_t* __restrict__ grad_mat1,
+    scalar_t* __restrict__ grad_Alpha) {
+
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(index < state1_size){
+        /*
+        int t1 = index % input_channel;
+        int t0 = (index / input_channel) % output_channel;
+        int t3 = (index / input_channel / output_channel) % width;
+        int t2 = (index / input_channel / output_channel) / width;
+        */
+        
+        int t3 = index % width;
+        int t2 = (index / width) % height;
+        int t1 = (index / width / height) % input_channel;
+        int t0 = (index / width / height) / input_channel;
+        
+
+        int spatial_size = height * width;
+        int Alpha_size = spatial_size * num;
+        int position = t2 * width + t3;
+
+        int offset_mat1 = (t0 * input_channel + t1) * num;
+        int mat1_size = output_channel * input_channel * num;
+
+        int output_size = output_channel * spatial_size;
+        int offset_output = t0 * spatial_size + position;
+
+        int mat0_size = input_channel * spatial_size;
+        int offset_mat0 = t1 * spatial_size + position;
+
+        if(mask_num == 1 && batch_W == 1){
+            scalar_t gradient = 0.0;
+            int offset_on_grad_output = offset_output;
+            int offset_on_mat0 = offset_mat0;
+            for(int i = 0; i < batch; ++i){
+                gradient += grad_output[offset_on_grad_output] * mat0[offset_on_mat0];
+                offset_on_grad_output += output_size;
+                offset_on_mat0 += mat0_size;
+            }
+            
+            if(use_alpha == 0){
+                // gradient of weight doesn't consider Alpha 
+                atomicAdd(grad_mat1 + offset_mat1 + int(mask[position]), gradient);
+            }
+           
+            int offset_on_Alpha = position;
+            for(int j = 0; j < num; ++j){
+                if(use_alpha == 1){
+                    // gradient of weight considers Alpha
+                    atomicAdd(grad_mat1 + offset_mat1 + j, Alpha[offset_on_Alpha] * gradient);
+                }
+                atomicAdd(grad_Alpha + offset_on_Alpha, gradient * mat1[offset_mat1 + j]);
+                offset_on_Alpha += spatial_size;
+            }
+        }
+        else{
+            int offset_on_mask = position;
+            int batch_offset_mat1 = offset_mat1;
+            int batch_offset_Alpha = position; 
+            int offset_on_grad_output = offset_output;
+            int offset_on_mat0 = offset_mat0;
+            for(int i = 0; i < batch; ++i){
+                scalar_t gradient = grad_output[offset_on_grad_output] * mat0[offset_on_mat0];
+
+                if(use_alpha == 0){
+                    // gradient of weight doesn't consider Alpha   
+                    atomicAdd(grad_mat1 + batch_offset_mat1 + int(mask[offset_on_mask]), gradient);
+                }
+               
+                int offset_on_Alpha = batch_offset_Alpha;
+                for(int j = 0; j < num; ++j){
+                    if(use_alpha == 1){
+                        // gradient of weight considers Alpha   
+                        atomicAdd(grad_mat1 + batch_offset_mat1 + j, Alpha[offset_on_Alpha] * gradient);
+                    }
+                    atomicAdd(grad_Alpha + offset_on_Alpha, gradient * mat1[batch_offset_mat1 + j]);
+                    offset_on_Alpha += spatial_size;
+                }
+
+                offset_on_mask = mask_num == 1 ? offset_on_mask : offset_on_mask + spatial_size;
+                batch_offset_mat1 = batch_W == 1 ? batch_offset_mat1 : batch_offset_mat1 + mat1_size;
+
+                batch_offset_Alpha += Alpha_size;
+                offset_on_grad_output += output_size;
+                offset_on_mat0 += mat0_size;
+            }
+        }
+
+    }
+}
+
+torch::Tensor Deformable_MatMul_forward_cuda(torch::Tensor mat0, torch::Tensor mat1, torch::Tensor mask,
+                                const int batch,
+                                const int input_channel,
+                                const int height,
+                                const int width,
+                                const int output_channel,
+                                const int num, 
+                                const int mask_num,
+                                const int batch_W) {
+
+  AT_ASSERTM(mat0.type().is_cuda(), "input must be a CUDA tensor");
+  AT_ASSERTM(mat1.type().is_cuda(), "input must be a CUDA tensor");
+  AT_ASSERTM(mask.type().is_cuda(), "input must be a CUDA tensor");
+
+  //auto output = torch::empty({batch, output_channel, height, width}, mat0.options());
+  auto output = at::empty({batch, output_channel, height, width}, mat0.options());
+  auto state_size = output_channel * height * width;
+
+  const int threads = 1024;
+  const dim3 blocks((state_size + threads - 1) / threads, batch);
+
+  AT_DISPATCH_FLOATING_TYPES(mat0.type(), "Deformable_MatMul_forward", [&] {
+    Deformable_MatMul_FForward<scalar_t><<<blocks, threads>>>(
+	 state_size,
+     mat0.data<scalar_t>(),
+     mat1.data<scalar_t>(),
+     mask.data<scalar_t>(),
+     batch,
+     input_channel,
+     height,
+     width,
+     output_channel,
+     num,
+     mask_num,
+     batch_W,
+     output.data<scalar_t>());
+  });
+  return output;
+}
+
+// TODO remove the dependency on input and use instead its sizes -> save memory
+std::vector<torch::Tensor> Deformable_MatMul_backward_cuda(
+        torch::Tensor grad_output, torch::Tensor mat0, torch::Tensor mat1, torch::Tensor mask, torch::Tensor Alpha,
+                                const int batch,
+                                const int input_channel,
+                                const int height,
+                                const int width,
+                                const int output_channel,
+                                const int num, 
+                                const int mask_num,
+                                const int batch_W,
+                                const int use_alpha) {
+  AT_ASSERTM(grad_output.type().is_cuda(), "grad must be a CUDA tensor");
+
+  auto grad_mat0 = torch::zeros_like(mat0);
+  auto state0_size = input_channel * height * width;
+  auto grad_mat1 = torch::zeros_like(mat1);
+  auto grad_Alpha = torch::zeros_like(Alpha);
+  auto state1_size = output_channel * input_channel * height * width;
+
+  //cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 1024;
+  const dim3 block0((state0_size + threads - 1) / threads, batch);
+  const dim3 block1((state1_size + threads - 1) / threads);
+
+    AT_DISPATCH_FLOATING_TYPES(grad_output.type(), "Deformable_MatMul_backward", [&] {
+       Deformable_MatMul_0FBackward<scalar_t><<<block0, threads>>>(
+            state0_size,
+            grad_output.data<scalar_t>(),
+            mat1.data<scalar_t>(),
+            mask.data<scalar_t>(),
+            batch,
+            input_channel,
+            height,
+            width,
+            output_channel,
+            num,
+            mask_num,
+            batch_W,
+            grad_mat0.data<scalar_t>());
+       Deformable_MatMul_1FBackward<scalar_t><<<block1, threads>>>(
+            state1_size,
+            grad_output.data<scalar_t>(),
+            mat0.data<scalar_t>(),
+            mat1.data<scalar_t>(),
+            mask.data<scalar_t>(),
+            Alpha.data<scalar_t>(),
+            batch,
+            input_channel,
+            height,
+            width,
+            output_channel,
+            num,
+            mask_num,
+            batch_W,
+            use_alpha,
+            grad_mat1.data<scalar_t>(),
+            grad_Alpha.data<scalar_t>());
+
+    });
+    //THCudaCheck(cudaGetLastError());
+    return {grad_mat0, grad_mat1, grad_Alpha};
+}
+
